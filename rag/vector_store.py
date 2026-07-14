@@ -25,6 +25,7 @@ class VectorStoreService:
             length_function=len,
         )
 
+    # 获取检索器，用于从向量数据库中检索文档
     def get_retriever(self):
         return self.vector_store.as_retriever(search_kwargs={"k": chroma_conf["k"]})
 

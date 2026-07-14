@@ -5,6 +5,9 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
+from langchain_core.prompts import PromptTemplate
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -12,11 +15,63 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent.react_agent import ReactAgent
 from agent.tools.agent_tools import rag, set_user_context
+from model.factory import judge_model
 
 DATASET_PATH = PROJECT_ROOT / "evaluation" / "datasets" / "qa_samples.jsonl"
 OUTPUT_DIR = PROJECT_ROOT / "evaluation" / "output"
 REPORT_PATH = OUTPUT_DIR / "latest_report.json"
 DETAIL_PATH = OUTPUT_DIR / "latest_details.csv"
+
+RAG_GOLD_SOURCE_MAP = {
+    "吸力变弱": ["故障排除.txt", "选购指南.txt"],
+    "漏扫": ["扫地机器人100问2.txt", "故障排除.txt"],
+    "拖布多久清洗": ["扫拖一体机器人100问.txt", "维护保养.txt"],
+    "边刷多久更换": ["维护保养.txt", "故障排除.txt"],
+    "地毯场景": ["选购指南.txt", "维护保养.txt"],
+}
+
+
+class JudgeResult(BaseModel):
+    score: int = Field(..., ge=1, le=5)
+    passed: bool
+    reason: str
+
+
+JUDGE_OUTPUT_PARSER = PydanticOutputParser(pydantic_object=JudgeResult)
+JUDGE_PROMPT = PromptTemplate.from_template(
+    """
+你是一个评测助手，需要判断智能客服回答是否满足要求。
+
+请根据以下维度评分：
+1. 是否回答了用户问题
+2. 内容是否基本正确，是否存在明显幻觉
+3. 是否覆盖了关键要点
+4. 表达是否清晰、可直接给用户使用
+
+评分规则：
+- 5分：完整、准确、清晰
+- 4分：基本正确，只有轻微缺失
+- 3分：部分正确，但有明显缺失
+- 2分：大部分不满足要求
+- 1分：答非所问或明显错误
+
+通过规则：
+- score >= 4 时，passed=true
+- 否则 passed=false
+
+样本类型：{sample_type}
+用户问题：{query}
+模型回答：{answer}
+期望关键词：{expected_keywords}
+预期工具：{expected_tools}
+标准来源：{gold_sources}
+实际检索来源：{retrieved_sources}
+
+请只输出 JSON，不要输出额外解释。
+{format_instructions}
+    """
+)
+JUDGE_CHAIN = (JUDGE_PROMPT | judge_model | StrOutputParser()) if judge_model is not None else None
 
 
 def generate_default_samples(total_samples: int = 100) -> list[dict]:
@@ -47,6 +102,7 @@ def generate_default_samples(total_samples: int = 100) -> list[dict]:
                     "query": query,
                     "expected_keywords": ["扫地机器人"],
                     "retrieval_expected_keywords": [topic[:4]],
+                    "gold_sources": infer_gold_sources(query),
                     "expected_tools": ["rag_summarize"],
                 }
             )
@@ -124,6 +180,9 @@ def normalize_sample(sample: dict) -> dict:
     normalized["history"] = history
     normalized["expected_keywords"] = normalized.get("expected_keywords", [])
     normalized["expected_tools"] = expected_tools
+    normalized["gold_sources"] = normalized.get("gold_sources") or infer_gold_sources(
+        normalized.get("query", "")
+    )
 
     if normalized["type"] == "rag" and "retrieval_expected_keywords" not in normalized:
         query = str(normalized.get("query", "")).replace("？", "").replace("?", "")
@@ -145,6 +204,35 @@ def evaluate_expected_tools(called_tools: list[str], expected_tools: list[str]) 
     return all(tool_name in called_tools for tool_name in expected_tools)
 
 
+def infer_gold_sources(query: str) -> list[str]:
+    query = str(query or "")
+    for key, sources in RAG_GOLD_SOURCE_MAP.items():
+        if key in query:
+            return list(sources)
+    return []
+
+
+def unique_in_order(values: list[str]) -> list[str]:
+    seen = set()
+    ordered = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def extract_retrieved_sources(retrieved_docs: list) -> list[str]:
+    sources = []
+    for doc in retrieved_docs:
+        metadata = getattr(doc, "metadata", {}) or {}
+        raw_source = str(metadata.get("source", "")).strip()
+        if raw_source:
+            sources.append(Path(raw_source).name)
+    return unique_in_order(sources)
+
+
 def evaluate_retrieval_hit(retrieved_docs: list, expected_keywords: list[str]) -> bool:
     if not expected_keywords:
         return False
@@ -153,16 +241,77 @@ def evaluate_retrieval_hit(retrieved_docs: list, expected_keywords: list[str]) -
     return all(keyword in combined_text for keyword in expected_keywords)
 
 
-def retrieve_for_eval(query: str, expected_keywords: list[str]) -> tuple[bool, float, str]:
+def evaluate_retrieval_by_sources(
+    retrieved_docs: list,
+    gold_sources: list[str],
+) -> tuple[bool, float, str]:
+    if not gold_sources:
+        return False, 0.0, ""
+
+    retrieved_sources = extract_retrieved_sources(retrieved_docs)
+    gold_set = set(gold_sources)
+    hit = any(source in gold_set for source in retrieved_sources)
+    recall = round(
+        len(set(retrieved_sources) & gold_set) / len(gold_set) * 100,
+        2,
+    )
+    return hit, recall, "|".join(retrieved_sources)
+
+
+def retrieve_for_eval(
+    query: str,
+    expected_keywords: list[str],
+    gold_sources: list[str],
+) -> tuple[bool, float, float, str, str]:
     start = perf_counter()
     try:
         docs = rag.retrieve_docs(query)
         latency_ms = round((perf_counter() - start) * 1000, 2)
-        hit = evaluate_retrieval_hit(docs, expected_keywords)
-        return hit, latency_ms, ""
+        if gold_sources:
+            hit, recall_at_k, retrieved_sources = evaluate_retrieval_by_sources(docs, gold_sources)
+        else:
+            hit = evaluate_retrieval_hit(docs, expected_keywords)
+            recall_at_k = 100.0 if hit else 0.0
+            retrieved_sources = "|".join(extract_retrieved_sources(docs))
+        return hit, recall_at_k, latency_ms, "", retrieved_sources
     except Exception as e:
         latency_ms = round((perf_counter() - start) * 1000, 2)
-        return False, latency_ms, str(e)[:200]
+        return False, 0.0, latency_ms, str(e)[:200], ""
+
+
+def should_run_judge(sample: dict) -> bool:
+    if JUDGE_CHAIN is None:
+        return False
+
+    if sample.get("type") == "rag":
+        return True
+    if sample.get("history"):
+        return True
+    return "fill_context_for_report" in sample.get("expected_tools", [])
+
+
+def judge_answer(sample: dict, answer: str, retrieved_sources: str) -> tuple[str, str, str]:
+    if JUDGE_CHAIN is None or not answer.strip():
+        return "", "", ""
+
+    input_dict = {
+        "sample_type": sample.get("type", "general"),
+        "query": sample.get("query", ""),
+        "answer": answer,
+        "expected_keywords": "、".join(sample.get("expected_keywords", [])) or "无",
+        "expected_tools": "、".join(sample.get("expected_tools", [])) or "无",
+        "gold_sources": "、".join(sample.get("gold_sources", [])) or "无",
+        "retrieved_sources": retrieved_sources or "无",
+        "format_instructions": JUDGE_OUTPUT_PARSER.get_format_instructions(),
+    }
+
+    try:
+        raw_output = JUDGE_CHAIN.invoke(input_dict)
+        parsed = JUDGE_OUTPUT_PARSER.parse(raw_output)
+    except Exception as e:
+        return "", "", f"judge输出解析失败: {str(e)[:160]}"
+
+    return str(parsed.score), str(int(parsed.passed)), parsed.reason[:200]
 
 
 def run_evaluation():
@@ -175,12 +324,18 @@ def run_evaluation():
     for sample in samples:
         sample_type = sample.get("type", "general")
         retrieval_hit = ""
+        retrieval_recall_at_k = ""
         retrieval_latency_ms = ""
         retrieval_error = ""
+        retrieved_sources = ""
+        judge_score = ""
+        judge_passed = ""
+        judge_reason = ""
         if sample_type == "rag":
-            retrieval_hit, retrieval_latency_ms, retrieval_error = retrieve_for_eval(
+            retrieval_hit, retrieval_recall_at_k, retrieval_latency_ms, retrieval_error, retrieved_sources = retrieve_for_eval(
                 sample["query"],
                 sample.get("retrieval_expected_keywords", []),
+                sample.get("gold_sources", []),
             )
 
         set_user_context(
@@ -224,6 +379,8 @@ def run_evaluation():
         expected_tools = sample.get("expected_tools", [])
         answer_correct = evaluate_answer(answer, expected_keywords)
         expected_tools_hit = evaluate_expected_tools(result["tool_calls"], expected_tools)
+        if should_run_judge(sample) and not model_unavailable:
+            judge_score, judge_passed, judge_reason = judge_answer(sample, answer, retrieved_sources)
 
         details.append(
             {
@@ -234,12 +391,17 @@ def run_evaluation():
                 "answer_correct": int(answer_correct),
                 "expected_tools_hit": int(expected_tools_hit),
                 "retrieval_hit": int(retrieval_hit) if retrieval_hit != "" else "",
+                "retrieval_recall_at_k": retrieval_recall_at_k,
                 "retrieval_latency_ms": retrieval_latency_ms,
                 "latency_ms": result["latency_ms"],
                 "tool_call_total": result["tool_call_total"],
                 "tool_call_success": result["tool_call_success"],
                 "tool_call_failed": result["tool_call_failed"],
                 "tool_calls": "|".join(result["tool_calls"]),
+                "retrieved_sources": retrieved_sources,
+                "judge_score": judge_score,
+                "judge_passed": judge_passed,
+                "judge_reason": judge_reason,
                 "answer_preview": answer[:120].replace("\n", " "),
                 "error_message": error_message[:200],
                 "retrieval_error": retrieval_error,
@@ -257,11 +419,19 @@ def run_evaluation():
 
     retrieval_total = len(rag_samples)
     retrieval_hit_count = sum(int(item["retrieval_hit"]) for item in rag_samples if item["retrieval_hit"] != "")
+    retrieval_recall_values = [
+        float(item["retrieval_recall_at_k"])
+        for item in rag_samples
+        if item["retrieval_recall_at_k"] != ""
+    ]
     retrieval_latency_values = [
         float(item["retrieval_latency_ms"])
         for item in rag_samples
         if item["retrieval_latency_ms"] != ""
     ]
+    judge_samples = [item for item in details if item["judge_score"] != ""]
+    judge_scores = [int(item["judge_score"]) for item in judge_samples]
+    judge_pass_count = sum(int(item["judge_passed"]) for item in judge_samples if item["judge_passed"] != "")
     multi_turn_correct = sum(item["answer_correct"] for item in multi_turn_samples)
     tool_accuracy_count = sum(item["expected_tools_hit"] for item in tool_expected_samples)
 
@@ -269,9 +439,21 @@ def run_evaluation():
     tool_success_rate = round((total_tool_success / total_tool_calls) * 100, 2) if total_tool_calls else 100.0
     tool_call_accuracy = round((tool_accuracy_count / len(tool_expected_samples)) * 100, 2) if tool_expected_samples else 0.0
     top_k_hit_rate = round((retrieval_hit_count / retrieval_total) * 100, 2) if retrieval_total else 0.0
+    avg_recall_at_k = (
+        round(sum(retrieval_recall_values) / len(retrieval_recall_values), 2)
+        if retrieval_recall_values else 0.0
+    )
     avg_retrieval_latency_ms = (
         round(sum(retrieval_latency_values) / len(retrieval_latency_values), 2)
         if retrieval_latency_values else 0.0
+    )
+    judge_pass_rate = (
+        round((judge_pass_count / len(judge_samples)) * 100, 2)
+        if judge_samples else 0.0
+    )
+    avg_judge_score = (
+        round(sum(judge_scores) / len(judge_scores), 2)
+        if judge_scores else 0.0
     )
     multi_turn_accuracy = (
         round((multi_turn_correct / len(multi_turn_samples)) * 100, 2)
@@ -289,7 +471,10 @@ def run_evaluation():
             "tool_success_rate": tool_success_rate,
             "tool_call_accuracy": tool_call_accuracy,
             "top_k_hit_rate": top_k_hit_rate,
+            "avg_recall_at_k": avg_recall_at_k,
             "avg_retrieval_latency_ms": avg_retrieval_latency_ms,
+            "judge_pass_rate": judge_pass_rate,
+            "avg_judge_score": avg_judge_score,
             "multi_turn_accuracy": multi_turn_accuracy,
             "avg_latency_ms": avg_latency_ms,
         },
@@ -300,6 +485,8 @@ def run_evaluation():
             "tool_expected_samples": len(tool_expected_samples),
             "rag_samples": retrieval_total,
             "retrieval_hit_count": retrieval_hit_count,
+            "judge_samples": len(judge_samples),
+            "judge_pass_count": judge_pass_count,
             "multi_turn_samples": len(multi_turn_samples),
             "multi_turn_correct_count": multi_turn_correct,
         },
@@ -312,8 +499,9 @@ def run_evaluation():
 
     fieldnames = [
         "id", "type", "query", "has_expected_tools", "answer_correct", "expected_tools_hit", "retrieval_hit",
-        "retrieval_latency_ms", "latency_ms", "tool_call_total", "tool_call_success",
-        "tool_call_failed", "tool_calls", "answer_preview", "error_message", "retrieval_error",
+        "retrieval_recall_at_k", "retrieval_latency_ms", "latency_ms", "tool_call_total", "tool_call_success",
+        "tool_call_failed", "tool_calls", "retrieved_sources", "judge_score", "judge_passed", "judge_reason",
+        "answer_preview", "error_message", "retrieval_error",
     ]
     with open(DETAIL_PATH, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -326,7 +514,10 @@ def run_evaluation():
     print(f"Tool success rate: {tool_success_rate}%")
     print(f"Tool call accuracy: {tool_call_accuracy}%")
     print(f"Top-K hit rate: {top_k_hit_rate}%")
+    print(f"Average Recall@K: {avg_recall_at_k}%")
     print(f"Average retrieval latency: {avg_retrieval_latency_ms} ms")
+    print(f"Judge pass rate: {judge_pass_rate}%")
+    print(f"Average judge score: {avg_judge_score}")
     print(f"Multi-turn accuracy: {multi_turn_accuracy}%")
     print(f"Average latency: {avg_latency_ms} ms")
     print(f"Report: {REPORT_PATH}")

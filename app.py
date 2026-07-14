@@ -2,7 +2,7 @@ import time
 
 import streamlit as st
 from agent.react_agent import ReactAgent
-from agent.tools.agent_tools import set_user_context
+from agent.tools.agent_tools import clear_user_context, set_user_context
 
 # 标题
 st.title("智扫通机器人智能客服")
@@ -23,6 +23,7 @@ with st.sidebar:
 
 for message in st.session_state["message"]:
     st.chat_message(message["role"]).write(message["content"])
+    #显示历史消息
 
 # 用户输入提示词
 prompt = st.chat_input()
@@ -49,7 +50,10 @@ if prompt:
                     time.sleep(0.01)
                     yield char
 
-        st.chat_message("assistant").write_stream(capture(res_stream, response_messages))
-        st.session_state["message"].append({"role": "assistant", "content": response_messages[-1]})
+        try:
+            st.chat_message("assistant").write_stream(capture(res_stream, response_messages))
+        finally:
+            clear_user_context()
+        final_response = response_messages[-1] if response_messages else "抱歉，本次未生成有效回复。"
+        st.session_state["message"].append({"role": "assistant", "content": final_response})
         st.rerun()
-

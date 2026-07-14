@@ -64,6 +64,7 @@ class RagSummarizeService:
     #   invoke(BaseMessage) -> str。
     #   内部逻辑：提取输入对象（如 AIMessage）的 .content 属性，将其转换为纯字符串。
 
+    # 输入
     def _init_chain(self):
         # 数据流：dict -> PromptValue -> AIMessage -> str
         chain = self.prompt_template | self.model | StrOutputParser()

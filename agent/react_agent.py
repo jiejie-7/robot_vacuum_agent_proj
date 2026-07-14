@@ -17,10 +17,12 @@ class ReactAgent:
             middleware=[monitor_tool, log_before_model, report_prompt_switch],
         )
 
+    #将消息内容转换为文本，用于后续处理
     @staticmethod
     def _message_content_to_text(content):
         if isinstance(content, str):
             return content
+        
         if isinstance(content, list):
             parts = []
             for part in content:
@@ -75,6 +77,7 @@ class ReactAgent:
         runtime_context = self._build_runtime_context(context)
         start = time.perf_counter()
         result = self.agent.invoke(input_dict, context=runtime_context)
+        # perf_counter()记录当前时间，单位是秒，2位小数，转换为毫秒
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
 
         answer = ""
@@ -99,7 +102,9 @@ class ReactAgent:
         # 第三个参数context就是上下文runtime中的信息，就是我们做提示词切换的标记
         for chunk in self.agent.stream(input_dict, stream_mode="values", context=runtime_context):
             latest_message = chunk["messages"][-1]
+            # 这里chunk是一个字典，每次更新messages，然后返回给streamlit显示
             if latest_message.content:
+    
                 yield self._message_content_to_text(latest_message.content).strip() + "\n"
                 
         '''

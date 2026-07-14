@@ -14,8 +14,14 @@ class BaseModelFactory(ABC):
 
 
 class ChatModelFactory(BaseModelFactory):
+    def __init__(self, config_key: str = "chat_model_name"):
+        self.config_key = config_key
+
     def generator(self) -> Optional[Embeddings | BaseChatModel]:
-        return ChatTongyi(model=rag_conf["chat_model_name"])
+        model_name = str(rag_conf.get(self.config_key, "") or "").strip()
+        if not model_name:
+            return None
+        return ChatTongyi(model=model_name)
 
 
 class EmbeddingsFactory(BaseModelFactory):
@@ -23,5 +29,6 @@ class EmbeddingsFactory(BaseModelFactory):
         return DashScopeEmbeddings(model=rag_conf["embedding_model_name"])
 
 
-chat_model = ChatModelFactory().generator()
+chat_model = ChatModelFactory("chat_model_name").generator()
+judge_model = ChatModelFactory("judge_model_name").generator()
 embed_model = EmbeddingsFactory().generator()
